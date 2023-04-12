@@ -71,6 +71,7 @@ class Head(nn.Module):
 
         sam = (q @ k.transpose(-2,-1)) * embed_dim**-0.5 # (batch , n_patches+1, n_patches+1)
         attn = sam.softmax(dim=-1) # (batch , n_patches+1, n_patches+1)
+        attn = self.attn_dropout(attn)
         weighted_average = attn @ v # (batch , n_patches+1, head_dim)
         return weighted_average
 
@@ -89,6 +90,37 @@ class MultiHeadedAttention(nn.Module):
     def forward(self, x):
         out = torch.cat([h(x) for h in self.heads], dim=-1) # (batch, n_patches+1, embed_dim)
         out = self.proj_drop(self.proj(out)) # (batch, n_patches+1, embed_dim)
+        return out
+
+
+
+class EfficientAttention(nn.Module):
+    def __init__(self, embed_dim, num_heads, attn_p, proj_p):
+        super(EfficientAttention, self).__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_size = int(self.embed_dim / num_heads)
+
+        self.qkv = nn.Linear(embed_dim, embed_dim*3)
+        self.attn_dropout = nn.Dropout(attn_p)
+        self.proj = nn.Linear(embed_dim, embed_dim)
+        self.proj_drop = nn.Dropout(proj_p)
+
+    def forward(self, x):
+        batch, patches, embed_dim = x.shape # (batch, n_patches+1, embed_dim)
+        qkv = self.qkv(x) # (batch, n_patches+1, 3*embed_dim)
+        qkv = qkv.reshape(batch, patches, 3, self.num_heads, self.head_size) # (batch, patch+1, 3, num_heads, head_size)
+        qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, batch, num_heads, patches+1, head_size)
+        q, k, v = qkv[0], qkv[1], qkv[2] # Each of shape (batch, num_heads, patches+1, head_size)
+
+        ### SAME AS BEFORE NOW ###
+        sam = (q @ k.transpose(-2,-1)) * self.head_size**-0.5 # (batch, num_heads, patches+1, patches+1)
+        attn = sam.softmax(dim=-1)
+        attn = self.attn_dropout(attn)
+        weighted_average = attn @ v # (batch, num_heads, patches+1, head_size)
+        weighted_average = weighted_average.transpose(1,2) # (batch, patches+1, num_heads, head_size)
+        weighted_average = weighted_average.flatten(2) # (batch, patches+1, embed_dim)
+        out = self.proj_drop(self.proj(weighted_average))
         return out
 
 
@@ -112,13 +144,21 @@ class TransformerBlock(nn.Module):
     """
     Full Transformer block with Attention and Linear Layers
     """
-    def __init__(self, embed_dim=768, n_heads=12, mlp_ratio=4.0, mlp_p=0, attn_p=0, proj_p=0):
+    def __init__(self, embed_dim=768, num_heads=12, mlp_ratio=4.0,
+                 mlp_p=0, attn_p=0, proj_p=0, efficient=True):
         super(TransformerBlock, self).__init__()
         self.norm1 = nn.LayerNorm(embed_dim, eps=1e-6)
-        self.attn = MultiHeadedAttention(embed_dim=embed_dim,
-                                         num_heads=n_heads,
-                                         attn_p=attn_p,
-                                         proj_p=proj_p)
+
+        if efficient:
+            self.attn = EfficientAttention(embed_dim=embed_dim,
+                                           num_heads=num_heads,
+                                           attn_p=attn_p,
+                                           proj_p=proj_p)
+        else:
+            self.attn = MultiHeadedAttention(embed_dim=embed_dim,
+                                             num_heads=num_heads,
+                                             attn_p=attn_p,
+                                             proj_p=proj_p)
 
         self.norm2 = nn.LayerNorm(embed_dim, eps=1e-6)
         hidden_features = int(embed_dim*mlp_ratio)
@@ -144,11 +184,11 @@ class VisionTransformer(nn.Module):
     n_classes: Number of outputs for classification
     embed_dim: Length of embedding vector for each patch
     depth: Number of wanted transformer blocks
-    n_heads: Number of wanted attention heads per block
+    num_heads: Number of wanted attention heads per block
     """
     def __init__(self, img_size=224, patch_size=16, in_chans=3, n_classes=2,
-                 embed_dim=768, depth=12, n_heads=12, mlp_ratio=4, attn_p=0.2,
-                 mlp_p=0.2, proj_p=0.2, pos_drop=0.2):
+                 embed_dim=768, depth=12, num_heads=12, mlp_ratio=4, attn_p=0.2,
+                 mlp_p=0.2, proj_p=0.2, pos_drop=0.2, efficient=True):
         super(VisionTransformer, self).__init__()
 
         self.patch_embed = PatchEmbed(img_size=img_size,
@@ -163,11 +203,12 @@ class VisionTransformer(nn.Module):
         self.blocks = nn.ModuleList(
             [
                 TransformerBlock(embed_dim=embed_dim,
-                                 n_heads=n_heads,
+                                 num_heads=num_heads,
                                  mlp_ratio=mlp_ratio,
                                  mlp_p=mlp_p,
                                  attn_p=attn_p,
-                                 proj_p=proj_p)
+                                 proj_p=proj_p,
+                                 efficient=efficient)
                 for _ in range(depth)
             ]
         )
@@ -264,9 +305,10 @@ def train(model, device, epochs, optimizer,
 
 
 if __name__ == "__main__":
-    ViT = VisionTransformer(embed_dim=128,
-                            depth=3,
-                            n_heads=4)
+    ViT = VisionTransformer(embed_dim=384,
+                            depth=6,
+                            num_heads=6,
+                            efficient=True)
 
     params = sum([np.prod(p.size()) for p in ViT.parameters()])
     print(f"Total Number of Parameters: {params}")
